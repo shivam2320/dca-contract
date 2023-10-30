@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.13;
 
-import "solmate/tokens/ERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/access/AccessControl.sol";
 
 struct SwapDescriptionV2 {
     address srcToken;
@@ -50,17 +51,19 @@ interface IKyberSwap {
     ) external payable returns (uint256 returnAmount, uint256 gasUsed);
 }
 
-contract DCA {
+contract DCA is AccessControl {
     IKyberSwap public kyberSwap;
 
     uint256 private _positionCounter;
+
+    bytes32 public constant FILLER = keccak256("FILLER");
 
     mapping(uint256 => DCAData) private positionData;
 
     error InvalidCaller();
     error InvalidToken();
     error InvalidAmount();
-    error PositionClosed();
+    error PositionClose();
 
     event PositionCreated(uint256 positionId);
     event PositionFilled(
@@ -72,6 +75,8 @@ contract DCA {
 
     constructor(IKyberSwap _kyberSwap) {
         kyberSwap = _kyberSwap;
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(FILLER, msg.sender);
     }
 
     function getPositionDetails(
@@ -83,7 +88,7 @@ contract DCA {
     function createPosition(
         DCAData memory dcaData
     ) external returns (uint256 positionId) {
-        ERC20(dcaData.srcToken).transferFrom(
+        IERC20(dcaData.srcToken).transferFrom(
             dcaData.user,
             address(this),
             dcaData.depositFrequency * dcaData.depositAmount
@@ -99,10 +104,10 @@ contract DCA {
     function fillPosition(
         uint256 _positionId,
         SwapExecutionParams calldata execution
-    ) external {
+    ) external onlyRole(FILLER) {
         DCAData memory _data = positionData[_positionId];
 
-        if (!dcaData.isOpen) revert PositionClosed();
+        if (!_data.isOpen) revert PositionClose();
         if (execution.desc.dstToken != _data.dstToken) revert InvalidToken();
         if (execution.desc.srcToken != _data.srcToken) revert InvalidToken();
         if (execution.desc.amount != _data.depositAmount)
@@ -125,17 +130,16 @@ contract DCA {
         DCAData memory _data = positionData[_positionId];
         if (msg.sender != _data.user) revert InvalidCaller();
         positionData[_positionId].isOpen = false;
-        ERC20(dcaData.srcToken).transfer(
-            address(this),
-            dcaData.user,
-            (dcaData.depositFrequency - dcaData.filledFrequency) *
-                dcaData.depositAmount
+        IERC20(_data.srcToken).transfer(
+            _data.user,
+            (_data.depositFrequency - _data.filledFrequency) *
+                _data.depositAmount
         );
 
         emit PositionClosed(
             _positionId,
-            (dcaData.depositFrequency - dcaData.filledFrequency) *
-                dcaData.depositAmount
+            (_data.depositFrequency - _data.filledFrequency) *
+                _data.depositAmount
         );
     }
 }
