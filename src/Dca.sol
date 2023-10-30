@@ -26,14 +26,20 @@ struct SwapExecutionParams {
     bytes clientData;
 }
 
+enum Frequency {
+    DAILY,
+    WEEKLY,
+    MONTHLY
+}
+
 struct DCAData {
+    Frequency frequency;
     address user;
-    address dcaToken;
-    address depositToken;
+    address dstToken;
+    address srcToken;
     uint256 depositAmount;
-    uint256 totalDepositAmount;
-    uint256 numOfDays;
-    uint256 filledDays;
+    uint256 depositFrequency;
+    uint256 filledFrequency;
     uint256 dcaTokenBalance;
     bool isOpen;
 }
@@ -52,9 +58,17 @@ contract DCA {
     mapping(uint256 => DCAData) private positionData;
 
     error InvalidCaller();
-    error DaysNotYetFilled();
     error InvalidToken();
     error InvalidAmount();
+    error PositionClosed();
+
+    event PositionCreated(uint256 positionId);
+    event PositionFilled(
+        uint256 positionId,
+        uint256 filledFrequency,
+        address filler
+    );
+    event PositionClosed(uint256 positionId, uint256 returnedAmount);
 
     constructor(IKyberSwap _kyberSwap) {
         kyberSwap = _kyberSwap;
@@ -69,15 +83,17 @@ contract DCA {
     function createPosition(
         DCAData memory dcaData
     ) external returns (uint256 positionId) {
-        ERC20(dcaData.depositToken).transferFrom(
+        ERC20(dcaData.srcToken).transferFrom(
             dcaData.user,
             address(this),
-            dcaData.totalDepositAmount
+            dcaData.depositFrequency * dcaData.depositAmount
         );
         _positionCounter++;
         positionData[_positionCounter] = dcaData;
 
         positionId = _positionCounter;
+
+        emit PositionCreated(positionId);
     }
 
     function fillPosition(
@@ -86,9 +102,9 @@ contract DCA {
     ) external {
         DCAData memory _data = positionData[_positionId];
 
-        if (execution.desc.dstToken != _data.dcaToken) revert InvalidToken();
-        if (execution.desc.srcToken != _data.depositToken)
-            revert InvalidToken();
+        if (!dcaData.isOpen) revert PositionClosed();
+        if (execution.desc.dstToken != _data.dstToken) revert InvalidToken();
+        if (execution.desc.srcToken != _data.srcToken) revert InvalidToken();
         if (execution.desc.amount != _data.depositAmount)
             revert InvalidAmount();
 
@@ -96,12 +112,30 @@ contract DCA {
 
         positionData[_positionId].dcaTokenBalance += returnAmount;
 
-        positionData[_positionId].filledDays += 1;
+        positionData[_positionId].filledFrequency += 1;
+
+        emit PositionFilled(
+            _positionId,
+            positionData[_positionId].filledFrequency,
+            msg.sender
+        );
     }
 
-    function withdrawPosition(uint256 _positionId) external {
+    function closePosition(uint256 _positionId) external {
         DCAData memory _data = positionData[_positionId];
         if (msg.sender != _data.user) revert InvalidCaller();
         positionData[_positionId].isOpen = false;
+        ERC20(dcaData.srcToken).transfer(
+            address(this),
+            dcaData.user,
+            (dcaData.depositFrequency - dcaData.filledFrequency) *
+                dcaData.depositAmount
+        );
+
+        emit PositionClosed(
+            _positionId,
+            (dcaData.depositFrequency - dcaData.filledFrequency) *
+                dcaData.depositAmount
+        );
     }
 }
