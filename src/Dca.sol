@@ -28,6 +28,7 @@ struct SwapExecutionParams {
 }
 
 enum Frequency {
+    HOURLY,
     DAILY,
     WEEKLY,
     MONTHLY
@@ -51,19 +52,19 @@ interface IKyberSwap {
     ) external payable returns (uint256 returnAmount, uint256 gasUsed);
 }
 
-contract DCA is AccessControl {
-    IKyberSwap public kyberSwap;
+contract DCATool is AccessControl {
+    IKyberSwap public kyber;
 
     uint256 private _positionCounter;
 
-    bytes32 public constant FILLER = keccak256("FILLER");
+    bytes32 public constant FILLER = keccak256("filler");
 
     mapping(uint256 => DCAData) private positionData;
 
     error InvalidCaller();
     error InvalidToken();
     error InvalidAmount();
-    error PositionClose();
+    error PositionClosed();
 
     event PositionCreated(uint256 positionId);
     event PositionFilled(
@@ -71,10 +72,10 @@ contract DCA is AccessControl {
         uint256 filledFrequency,
         address filler
     );
-    event PositionClosed(uint256 positionId, uint256 returnedAmount);
+    event PositionClose(uint256 positionId, uint256 returnedAmount);
 
     constructor(IKyberSwap _kyberSwap) {
-        kyberSwap = _kyberSwap;
+        kyber = _kyberSwap;
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _grantRole(FILLER, msg.sender);
     }
@@ -107,13 +108,13 @@ contract DCA is AccessControl {
     ) external onlyRole(FILLER) {
         DCAData memory _data = positionData[_positionId];
 
-        if (!_data.isOpen) revert PositionClose();
+        if (!_data.isOpen) revert PositionClosed();
         if (execution.desc.dstToken != _data.dstToken) revert InvalidToken();
         if (execution.desc.srcToken != _data.srcToken) revert InvalidToken();
         if (execution.desc.amount != _data.depositAmount)
             revert InvalidAmount();
 
-        (uint256 returnAmount, ) = IKyberSwap(kyberSwap).swap(execution);
+        (uint256 returnAmount, ) = IKyberSwap(kyber).swap(execution);
 
         positionData[_positionId].dcaTokenBalance += returnAmount;
 
@@ -136,7 +137,7 @@ contract DCA is AccessControl {
                 _data.depositAmount
         );
 
-        emit PositionClosed(
+        emit PositionClose(
             _positionId,
             (_data.depositFrequency - _data.filledFrequency) *
                 _data.depositAmount
