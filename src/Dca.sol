@@ -1,31 +1,9 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.13;
 
-import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/access/AccessControl.sol";
-
-struct SwapDescriptionV2 {
-    address srcToken;
-    address dstToken;
-    address[] srcReceivers; // transfer src token to these addresses, default
-    uint256[] srcAmounts;
-    address[] feeReceivers;
-    uint256[] feeAmounts;
-    address dstReceiver;
-    uint256 amount;
-    uint256 minReturnAmount;
-    uint256 flags;
-    bytes permit;
-}
-
-/// @dev  use for swapGeneric and swap to avoid stack too deep
-struct SwapExecutionParams {
-    address callTarget; // call this address
-    address approveTarget; // approve this address if _APPROVE_FUND set
-    bytes targetData;
-    SwapDescriptionV2 desc;
-    bytes clientData;
-}
+import "@uniswap/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol";
 
 enum Frequency {
     HOURLY,
@@ -46,25 +24,23 @@ struct DCAData {
     bool isOpen;
 }
 
-interface IKyberSwap {
-    function swap(
-        SwapExecutionParams calldata execution
-    ) external payable returns (uint256 returnAmount, uint256 gasUsed);
-}
-
 contract DCATool is AccessControl {
-    IKyberSwap public kyber;
+    using SafeERC20 for IERC20;
+
+    IUniswapV2Router02 public swapRouter;
+
+    address private constant NATIVE_TOKEN_ADDRESS =
+        address(0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE);
 
     uint256 private _positionCounter;
 
-    bytes32 public constant FILLER = keccak256("filler");
+    bytes32 public constant FILLER = keccak256("FILLER");
 
     mapping(uint256 => DCAData) private positionData;
 
-    error InvalidCaller();
-    error InvalidToken();
-    error InvalidAmount();
+    error PositionAlreadyFilled();
     error PositionClosed();
+    error InvalidCaller();
 
     event PositionCreated(uint256 positionId);
     event PositionFilled(
@@ -74,8 +50,8 @@ contract DCATool is AccessControl {
     );
     event PositionClose(uint256 positionId, uint256 returnedAmount);
 
-    constructor(IKyberSwap _kyberSwap) {
-        kyber = _kyberSwap;
+    constructor(IUniswapV2Router02 _swapRouter) {
+        swapRouter = _swapRouter;
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _grantRole(FILLER, msg.sender);
     }
@@ -89,7 +65,7 @@ contract DCATool is AccessControl {
     function createPosition(
         DCAData memory dcaData
     ) external returns (uint256 positionId) {
-        IERC20(dcaData.srcToken).transferFrom(
+        IERC20(dcaData.srcToken).safeTransferFrom(
             dcaData.user,
             address(this),
             dcaData.depositFrequency * dcaData.depositAmount
@@ -102,19 +78,28 @@ contract DCATool is AccessControl {
         emit PositionCreated(positionId);
     }
 
-    function fillPosition(
-        uint256 _positionId,
-        SwapExecutionParams calldata execution
-    ) external onlyRole(FILLER) {
+    function fillPosition(uint256 _positionId) public onlyRole(FILLER) {
         DCAData memory _data = positionData[_positionId];
 
         if (!_data.isOpen) revert PositionClosed();
-        if (execution.desc.dstToken != _data.dstToken) revert InvalidToken();
-        if (execution.desc.srcToken != _data.srcToken) revert InvalidToken();
-        if (execution.desc.amount != _data.depositAmount)
-            revert InvalidAmount();
+        if (_data.depositFrequency == _data.filledFrequency)
+            revert PositionAlreadyFilled();
 
-        (uint256 returnAmount, ) = IKyberSwap(kyber).swap(execution);
+        uint256 returnAmount;
+        if (_data.srcToken == NATIVE_TOKEN_ADDRESS) {
+            returnAmount = swapNative(
+                _data.dstToken,
+                _data.user,
+                _data.depositAmount
+            );
+        } else {
+            returnAmount = swapERC20(
+                _data.srcToken,
+                _data.dstToken,
+                _data.depositAmount,
+                _data.user
+            );
+        }
 
         positionData[_positionId].dcaTokenBalance += returnAmount;
 
@@ -127,11 +112,23 @@ contract DCATool is AccessControl {
         );
     }
 
+    function bulkFillPosition(
+        uint256[] calldata _positionIds
+    ) external onlyRole(FILLER) {
+        uint256 leng = _positionIds.length;
+        for (uint256 i; i < leng; ) {
+            fillPosition(_positionIds[i]);
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
     function closePosition(uint256 _positionId) external {
         DCAData memory _data = positionData[_positionId];
         if (msg.sender != _data.user) revert InvalidCaller();
         positionData[_positionId].isOpen = false;
-        IERC20(_data.srcToken).transfer(
+        IERC20(_data.srcToken).safeTransfer(
             _data.user,
             (_data.depositFrequency - _data.filledFrequency) *
                 _data.depositAmount
@@ -142,5 +139,81 @@ contract DCATool is AccessControl {
             (_data.depositFrequency - _data.filledFrequency) *
                 _data.depositAmount
         );
+    }
+
+    /**
+    // @notice function responsible to swap ERC20 -> ERC20
+    // @param _tokenIn address of input token
+    // @param _tokenOut address of output token
+    // @param amountIn amount of input tokens
+    // param extraData extra data if required
+     */
+    function swapERC20(
+        address _tokenIn,
+        address _tokenOut,
+        uint256 amountIn,
+        address _receiver
+    ) private returns (uint256 amountOut) {
+        uint256[] memory amountsOut;
+
+        IERC20(_tokenIn).forceApprove(address(swapRouter), amountIn);
+
+        address[] memory path = new address[](2);
+        path[0] = _tokenIn;
+        path[1] = _tokenOut;
+
+        if (_tokenOut == 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE) {
+            path[1] = swapRouter.WETH();
+            amountsOut = swapRouter.getAmountsOut(amountIn, path);
+            swapRouter.swapExactTokensForETH(
+                amountIn,
+                amountsOut[path.length - 1],
+                path,
+                _receiver,
+                block.timestamp + 20
+            );
+
+            amountOut = amountsOut[path.length - 1];
+        } else {
+            amountsOut = swapRouter.getAmountsOut(amountIn, path);
+            swapRouter.swapExactTokensForTokens(
+                amountIn,
+                amountsOut[path.length - 1],
+                path,
+                _receiver,
+                block.timestamp + 20
+            );
+
+            amountOut = amountsOut[path.length - 1];
+        }
+    }
+
+    /**
+    // @notice function responsible to swap NATIVE -> ERC20
+    // @param _tokenOut address of output token
+    // param extraData extra data if required
+     */
+    function swapNative(
+        address _tokenOut,
+        address _receiver,
+        uint256 _depositAmount
+    ) private returns (uint256 amountOut) {
+        uint256[] memory amountsOut;
+
+        //swapExactETHfortokens
+        address[] memory path = new address[](2);
+        path[0] = swapRouter.WETH();
+        path[1] = _tokenOut;
+
+        amountsOut = swapRouter.getAmountsOut(_depositAmount, path);
+
+        swapRouter.swapExactETHForTokens{value: _depositAmount}(
+            amountsOut[path.length - 1],
+            path,
+            _receiver,
+            block.timestamp + 20
+        );
+
+        amountOut = amountsOut[path.length - 1];
     }
 }
