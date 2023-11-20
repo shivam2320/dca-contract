@@ -34,6 +34,8 @@ contract DCATool is AccessControl {
 
     uint256 private _positionCounter;
 
+    uint256 private _fees;
+
     bytes32 public constant FILLER = keccak256("FILLER");
 
     mapping(uint256 => DCAData) private positionData;
@@ -65,10 +67,15 @@ contract DCATool is AccessControl {
     function createPosition(
         DCAData memory dcaData
     ) external returns (uint256 positionId) {
+        uint256 totalAmount = dcaData.depositFrequency * dcaData.depositAmount;
+        uint256 fees;
+        if (_fees != 0) {
+            fees = (_fees * totalAmount) / 10000;
+        }
         IERC20(dcaData.srcToken).safeTransferFrom(
             dcaData.user,
             address(this),
-            dcaData.depositFrequency * dcaData.depositAmount
+            totalAmount + fees
         );
         _positionCounter++;
         positionData[_positionCounter] = dcaData;
@@ -215,5 +222,18 @@ contract DCATool is AccessControl {
         );
 
         amountOut = amountsOut[path.length - 1];
+    }
+
+    function changeFees(
+        uint256 _newFees
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _fees = _newFees;
+    }
+
+    function withdrawFees(
+        uint256 _amount,
+        address _token
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        IERC20(_token).safeTransfer(msg.sender, _amount);
     }
 }
