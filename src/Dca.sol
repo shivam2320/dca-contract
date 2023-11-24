@@ -38,7 +38,11 @@ contract DCATool is AccessControl {
 
     bytes32 public constant FILLER = keccak256("FILLER");
 
-    mapping(uint256 => DCAData) private positionData;
+    mapping(address => uint256) private collectedFees;
+
+    mapping(uint256 => DCAData) public positionData;
+
+    mapping(address => uint256[]) public userPositionIds;
 
     error PositionAlreadyFilled();
     error PositionClosed();
@@ -64,6 +68,21 @@ contract DCATool is AccessControl {
         return positionData[_positionId];
     }
 
+    function getUserPositions(
+        address user
+    ) external view returns (DCAData[] memory) {
+        uint256[] memory positionIds = userPositionIds[user];
+        DCAData[] memory data = new DCAData[](positionIds.length);
+
+        for (uint i; i < positionIds.length; ) {
+            data[i] = positionData[positionIds[i]];
+            unchecked {
+                ++i;
+            }
+        }
+        return data;
+    }
+
     function createPosition(
         DCAData memory dcaData
     ) external returns (uint256 positionId) {
@@ -71,6 +90,7 @@ contract DCATool is AccessControl {
         uint256 fees;
         if (_fees != 0) {
             fees = (_fees * totalAmount) / 10000;
+            collectedFees[dcaData.srcToken] += fees;
         }
         IERC20(dcaData.srcToken).safeTransferFrom(
             dcaData.user,
@@ -81,6 +101,7 @@ contract DCATool is AccessControl {
         positionData[_positionCounter] = dcaData;
 
         positionId = _positionCounter;
+        userPositionIds[dcaData.user].push(positionId);
 
         emit PositionCreated(positionId);
     }
@@ -231,9 +252,31 @@ contract DCATool is AccessControl {
     }
 
     function withdrawFees(
-        uint256 _amount,
-        address _token
+        address[] memory _tokens
     ) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        IERC20(_token).safeTransfer(msg.sender, _amount);
+        for (uint i; i < _tokens.length; ) {
+            IERC20(_tokens[i]).safeTransfer(
+                msg.sender,
+                collectedFees[_tokens[i]]
+            );
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    /// @notice function responsible to rescue tokens if any
+    /// @dev onlyOwner can access this function
+    /// @param  tokenAddr address of locked token
+    function rescueFunds(
+        address tokenAddr
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (tokenAddr == NATIVE_TOKEN_ADDRESS) {
+            uint256 balance = address(this).balance;
+            payable(msg.sender).transfer(balance);
+        } else {
+            uint256 balance = IERC20(tokenAddr).balanceOf(address(this));
+            IERC20(tokenAddr).safeTransfer(msg.sender, balance);
+        }
     }
 }
