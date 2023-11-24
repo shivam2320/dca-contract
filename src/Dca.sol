@@ -3,6 +3,7 @@ pragma solidity ^0.8.13;
 
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/proxy/utils/Initializable.sol";
 import "@uniswap/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol";
 
 enum Frequency {
@@ -24,50 +25,70 @@ struct DCAData {
     bool isOpen;
 }
 
-contract DCATool is AccessControl {
+/// @title DCA contract
+contract DCATool is AccessControl, Initializable {
     using SafeERC20 for IERC20;
 
+    /// @dev Address of Zebra swap router
     IUniswapV2Router02 public swapRouter;
 
+    /// @dev Address to represent native token
     address private constant NATIVE_TOKEN_ADDRESS =
         address(0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE);
 
+    /// @dev Counter to track positions
     uint256 private _positionCounter;
 
+    /// @dev Protocol fees for managing positions
     uint256 private _fees;
 
+    /// @dev FILLER role
     bytes32 public constant FILLER = keccak256("FILLER");
 
+    /// @dev Mapping to track of fees collected in a specific token
     mapping(address => uint256) private collectedFees;
 
+    /// @dev Mapping to map position id with dca data
     mapping(uint256 => DCAData) public positionData;
 
+    /// @dev Address of Zebra swap router
     mapping(address => uint256[]) public userPositionIds;
 
+    /// @dev Error if position is already filled
     error PositionAlreadyFilled();
+
+    /// @dev Error if position is closed
     error PositionClosed();
+
+    /// @dev Error if caller address is invalid
     error InvalidCaller();
 
+    /// @dev Error if amount is invalid
+    error InvalidAmount();
+
+    /// @dev Trigger when new position is created
     event PositionCreated(uint256 positionId);
+
+    /// @dev Trigger when position is filled
     event PositionFilled(
         uint256 positionId,
         uint256 filledFrequency,
         address filler
     );
+
+    /// @dev Trigger when position is closed
     event PositionClose(uint256 positionId, uint256 returnedAmount);
 
-    constructor(IUniswapV2Router02 _swapRouter) {
+    /// @dev initialize Function to initialize this contract
+    /// @param _swapRouter Address of Zebra swap router
+    function initialize(IUniswapV2Router02 _swapRouter) external initializer {
         swapRouter = _swapRouter;
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _grantRole(FILLER, msg.sender);
     }
 
-    function getPositionDetails(
-        uint256 _positionId
-    ) external view returns (DCAData memory) {
-        return positionData[_positionId];
-    }
-
+    /// @dev Returns all positions for a particular user
+    /// @param user Address of user
     function getUserPositions(
         address user
     ) external view returns (DCAData[] memory) {
@@ -83,20 +104,26 @@ contract DCATool is AccessControl {
         return data;
     }
 
+    /// @dev This function is used to create new dca position
+    /// @param dcaData DCAData struct
     function createPosition(
         DCAData memory dcaData
-    ) external returns (uint256 positionId) {
+    ) external payable returns (uint256 positionId) {
         uint256 totalAmount = dcaData.depositFrequency * dcaData.depositAmount;
         uint256 fees;
         if (_fees != 0) {
             fees = (_fees * totalAmount) / 10000;
             collectedFees[dcaData.srcToken] += fees;
         }
-        IERC20(dcaData.srcToken).safeTransferFrom(
-            dcaData.user,
-            address(this),
-            totalAmount + fees
-        );
+        if (dcaData.srcToken == NATIVE_TOKEN_ADDRESS) {
+            if (msg.value != totalAmount + fees) revert InvalidAmount();
+        } else {
+            IERC20(dcaData.srcToken).safeTransferFrom(
+                dcaData.user,
+                address(this),
+                totalAmount + fees
+            );
+        }
         _positionCounter++;
         positionData[_positionCounter] = dcaData;
 
@@ -106,6 +133,9 @@ contract DCATool is AccessControl {
         emit PositionCreated(positionId);
     }
 
+    /// @dev This function is used to fill positions
+    /// @dev Can only be called by Filler
+    /// @param _positionId Id of position to fill
     function fillPosition(uint256 _positionId) public onlyRole(FILLER) {
         DCAData memory _data = positionData[_positionId];
 
@@ -140,6 +170,9 @@ contract DCATool is AccessControl {
         );
     }
 
+    /// @dev This function is used to fill positions in bulk
+    /// @dev Can only be called by Filler
+    /// @param _positionIds Ids of positions to fill
     function bulkFillPosition(
         uint256[] calldata _positionIds
     ) external onlyRole(FILLER) {
@@ -152,6 +185,9 @@ contract DCATool is AccessControl {
         }
     }
 
+    /// @dev This function is used to close position
+    /// @dev Can only be called by user of position
+    /// @param _positionId Id of position to close
     function closePosition(uint256 _positionId) external {
         DCAData memory _data = positionData[_positionId];
         if (msg.sender != _data.user) revert InvalidCaller();
@@ -169,13 +205,10 @@ contract DCATool is AccessControl {
         );
     }
 
-    /**
     // @notice function responsible to swap ERC20 -> ERC20
     // @param _tokenIn address of input token
     // @param _tokenOut address of output token
     // @param amountIn amount of input tokens
-    // param extraData extra data if required
-     */
     function swapERC20(
         address _tokenIn,
         address _tokenOut,
@@ -216,15 +249,14 @@ contract DCATool is AccessControl {
         }
     }
 
-    /**
-    // @notice function responsible to swap NATIVE -> ERC20
-    // @param _tokenOut address of output token
-    // param extraData extra data if required
-     */
+    /// @notice function responsible to swap NATIVE -> ERC20
+    /// @param _tokenOut Address of token to swap
+    /// @param _receiver Address of receiver
+    /// @param _swapAmount Amount to swap
     function swapNative(
         address _tokenOut,
         address _receiver,
-        uint256 _depositAmount
+        uint256 _swapAmount
     ) private returns (uint256 amountOut) {
         uint256[] memory amountsOut;
 
@@ -233,9 +265,9 @@ contract DCATool is AccessControl {
         path[0] = swapRouter.WETH();
         path[1] = _tokenOut;
 
-        amountsOut = swapRouter.getAmountsOut(_depositAmount, path);
+        amountsOut = swapRouter.getAmountsOut(_swapAmount, path);
 
-        swapRouter.swapExactETHForTokens{value: _depositAmount}(
+        swapRouter.swapExactETHForTokens{value: _swapAmount}(
             amountsOut[path.length - 1],
             path,
             _receiver,
@@ -245,12 +277,18 @@ contract DCATool is AccessControl {
         amountOut = amountsOut[path.length - 1];
     }
 
+    /// @notice This function is responsible for changing protocol fees
+    /// @dev onlyAdmin can call this function
+    /// @param _newFees New fees
     function changeFees(
         uint256 _newFees
     ) external onlyRole(DEFAULT_ADMIN_ROLE) {
         _fees = _newFees;
     }
 
+    /// @notice This function is responsible for withdrawing protocol fees
+    /// @dev onlyAdmin can call this function
+    /// @param  _tokens addresses of tokens to withdraw fees
     function withdrawFees(
         address[] memory _tokens
     ) external onlyRole(DEFAULT_ADMIN_ROLE) {
@@ -266,7 +304,7 @@ contract DCATool is AccessControl {
     }
 
     /// @notice function responsible to rescue tokens if any
-    /// @dev onlyOwner can access this function
+    /// @dev onlyAdmin can access this function
     /// @param  tokenAddr address of locked token
     function rescueFunds(
         address tokenAddr
